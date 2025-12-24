@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  nornicdb:
+    image: nornicdb/nornicdb:latest
+    container_name: nornicdb
+    restart: unless-stopped
+    ports:
+      - "7474:7474"  # Browser UI
+      - "7687:7687"  # Bolt protocol
+    volumes:
+      - nornicdb_data:/data
+    environment:
+      # No authentication required for local development
+      - NEO4J_AUTH=none
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "7687"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  nornicdb_data:
+    name: nornicdb_data
