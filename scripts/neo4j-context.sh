@@ -37,41 +37,159 @@ check_connection() {
 
 # Get node count for project (fast query)
 get_doc_count() {
-    python3 -c "
+    python3 - "$PROJECT" << 'PYTHON_EOF'
+import sys
 from neo4j import GraphDatabase
+
+project = sys.argv[1]
 try:
-    driver = GraphDatabase.driver('$NEO4J_URI')
+    driver = GraphDatabase.driver('bolt://localhost:7687')
     with driver.session() as session:
-        result = session.run('MATCH (n) WHERE n:$PROJECT AND n:Document RETURN count(n) as c')
-        print(result.single()['c'])
+        result = session.run(f'MATCH (n:{project}:Document) RETURN count(n) as c')
+        record = result.single()
+        print(record['c'] if record else '0')
     driver.close()
 except:
     print('0')
-" 2>/dev/null
+PYTHON_EOF
 }
 
-# Auto-populate if project has no docs in graph
-auto_populate_if_needed() {
-    local docs_path="${CLAUDE_PROJECT_DIR:-$(pwd)}/docs"
+# Get code file count for project
+get_code_count() {
+    python3 - "$PROJECT" << 'PYTHON_EOF'
+import sys
+from neo4j import GraphDatabase
 
-    # Skip if no docs folder
-    [[ ! -d "$docs_path" ]] && return 0
+project = sys.argv[1]
+try:
+    driver = GraphDatabase.driver('bolt://localhost:7687')
+    with driver.session() as session:
+        result = session.run(f'MATCH (n:{project}:File) RETURN count(n) as c')
+        record = result.single()
+        print(record['c'] if record else '0')
+    driver.close()
+except:
+    print('0')
+PYTHON_EOF
+}
+
+# Auto-populate code if project has no code files in graph
+auto_populate_code_if_needed() {
+    local project_dir="${CLAUDE_PROJECT_DIR:-$(pwd)}"
 
     # Check if already populated
     local count
-    count=$(get_doc_count)
+    count=$(get_code_count)
 
     if [[ "$count" == "0" ]]; then
-        echo "   ⏳ Auto-populating docs graph (first time)..."
-        # Run populate in background, don't block session start
-        nohup python3 ~/.claude/scripts/populate-doc-graph.py \
-            --project "$PROJECT" \
-            --docs-path "$docs_path" \
-            > /tmp/nornicdb-populate-$PROJECT.log 2>&1 &
-        echo "   📝 Running in background, check /tmp/nornicdb-populate-$PROJECT.log"
+        echo "   ⏳ Auto-populating code graph (first time)..."
+
+        # Create background job that indexes all supported languages
+        nohup bash -c '
+            # Source the main script to get access to update functions
+            source ~/.claude/scripts/neo4j-context.sh
+            PROJECT="'"$PROJECT"'"
+            project_dir="'"$project_dir"'"
+
+            # Index TypeScript/JavaScript files
+            find "$project_dir" -type f \( -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.jsx" \) \
+                -not -path "*/node_modules/*" \
+                -not -path "*/dist/*" \
+                -not -path "*/build/*" \
+                -not -path "*/.next/*" \
+                -not -path "*/coverage/*" \
+                -not -path "*/.nuxt/*" 2>/dev/null | \
+            while IFS= read -r file; do
+                update_ts_file_node "$file" "$project_dir" 2>/dev/null || true
+            done
+
+            # Index Python files
+            find "$project_dir" -type f -name "*.py" \
+                -not -path "*/venv/*" \
+                -not -path "*/.venv/*" \
+                -not -path "*/__pycache__/*" \
+                -not -path "*/site-packages/*" 2>/dev/null | \
+            while IFS= read -r file; do
+                update_py_file_node "$file" "$project_dir" 2>/dev/null || true
+            done
+
+            # Index Go files
+            find "$project_dir" -type f -name "*.go" \
+                -not -path "*/vendor/*" 2>/dev/null | \
+            while IFS= read -r file; do
+                update_go_file_node "$file" "$project_dir" 2>/dev/null || true
+            done
+
+            # Index Rust files
+            find "$project_dir" -type f -name "*.rs" \
+                -not -path "*/target/*" 2>/dev/null | \
+            while IFS= read -r file; do
+                update_rust_file_node "$file" "$project_dir" 2>/dev/null || true
+            done
+
+            # Index Java files
+            find "$project_dir" -type f -name "*.java" \
+                -not -path "*/build/*" \
+                -not -path "*/target/*" 2>/dev/null | \
+            while IFS= read -r file; do
+                update_java_file_node "$file" "$project_dir" 2>/dev/null || true
+            done
+
+            # Index C# files
+            find "$project_dir" -type f -name "*.cs" \
+                -not -path "*/bin/*" \
+                -not -path "*/obj/*" 2>/dev/null | \
+            while IFS= read -r file; do
+                update_csharp_file_node "$file" "$project_dir" 2>/dev/null || true
+            done
+
+            # Index Ruby files
+            find "$project_dir" -type f -name "*.rb" \
+                -not -path "*/vendor/*" 2>/dev/null | \
+            while IFS= read -r file; do
+                update_ruby_file_node "$file" "$project_dir" 2>/dev/null || true
+            done
+
+            # Index PHP files
+            find "$project_dir" -type f -name "*.php" \
+                -not -path "*/vendor/*" 2>/dev/null | \
+            while IFS= read -r file; do
+                update_php_file_node "$file" "$project_dir" 2>/dev/null || true
+            done
+
+            echo "Code indexing complete for $PROJECT"
+        ' > /tmp/nornicdb-populate-code-$PROJECT.log 2>&1 &
+
+        echo "   💻 Running in background, check /tmp/nornicdb-populate-code-$PROJECT.log"
     else
-        echo "   📄 $count documents indexed"
+        echo "   💻 $count code files indexed"
     fi
+}
+
+# Auto-populate if project has no docs/code in graph
+auto_populate_if_needed() {
+    local docs_path="${CLAUDE_PROJECT_DIR:-$(pwd)}/docs"
+
+    # Check and populate docs if docs folder exists
+    if [[ -d "$docs_path" ]]; then
+        local doc_count
+        doc_count=$(get_doc_count)
+
+        if [[ "$doc_count" == "0" ]]; then
+            echo "   ⏳ Auto-populating docs graph (first time)..."
+            # Run populate in background, don't block session start
+            nohup python3 ~/.claude/scripts/populate-doc-graph.py \
+                --project "$PROJECT" \
+                --docs-path "$docs_path" \
+                > /tmp/nornicdb-populate-docs-$PROJECT.log 2>&1 &
+            echo "   📝 Running in background, check /tmp/nornicdb-populate-docs-$PROJECT.log"
+        else
+            echo "   📄 $doc_count documents indexed"
+        fi
+    fi
+
+    # Check and populate code
+    auto_populate_code_if_needed
 }
 
 # Get project summary from graph
@@ -110,20 +228,133 @@ populate_docs() {
 
 # Populate code graph for current project
 populate_code() {
-    local code_path="${CLAUDE_PROJECT_DIR:-$(pwd)}"
+    local project_dir="${CLAUDE_PROJECT_DIR:-$(pwd)}"
 
     echo "Populating code graph for $PROJECT..."
 
-    # Check for Go files
-    if find "$code_path" -name "*.go" -not -path "*/vendor/*" | head -1 | grep -q .; then
-        echo "Found Go files, using Go AST parser..."
-        cd "$code_path" && go run ~/.claude/scripts/populate-code-graph.go \
-            --project "$PROJECT" \
-            --path .
-    else
-        echo "No Go files found. Code graph populator currently supports Go only."
-        echo "For other languages, use the Code Grapher MCP or add support."
+    # Count files by type
+    local ts_files py_files go_files rust_files java_files csharp_files ruby_files php_files
+    ts_files=$(find "$project_dir" -type f \( -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.jsx" \) \
+        -not -path "*/node_modules/*" -not -path "*/dist/*" -not -path "*/build/*" \
+        -not -path "*/.next/*" -not -path "*/coverage/*" 2>/dev/null | wc -l | tr -d ' ')
+    py_files=$(find "$project_dir" -type f -name "*.py" \
+        -not -path "*/venv/*" -not -path "*/.venv/*" -not -path "*/__pycache__/*" \
+        -not -path "*/site-packages/*" 2>/dev/null | wc -l | tr -d ' ')
+    go_files=$(find "$project_dir" -type f -name "*.go" \
+        -not -path "*/vendor/*" 2>/dev/null | wc -l | tr -d ' ')
+    rust_files=$(find "$project_dir" -type f -name "*.rs" \
+        -not -path "*/target/*" 2>/dev/null | wc -l | tr -d ' ')
+    java_files=$(find "$project_dir" -type f -name "*.java" \
+        -not -path "*/build/*" -not -path "*/target/*" 2>/dev/null | wc -l | tr -d ' ')
+    csharp_files=$(find "$project_dir" -type f -name "*.cs" \
+        -not -path "*/bin/*" -not -path "*/obj/*" 2>/dev/null | wc -l | tr -d ' ')
+    ruby_files=$(find "$project_dir" -type f -name "*.rb" \
+        -not -path "*/vendor/*" 2>/dev/null | wc -l | tr -d ' ')
+    php_files=$(find "$project_dir" -type f -name "*.php" \
+        -not -path "*/vendor/*" 2>/dev/null | wc -l | tr -d ' ')
+
+    if [[ "$ts_files" -eq 0 ]] && [[ "$py_files" -eq 0 ]] && [[ "$go_files" -eq 0 ]] && \
+       [[ "$rust_files" -eq 0 ]] && [[ "$java_files" -eq 0 ]] && [[ "$csharp_files" -eq 0 ]] && \
+       [[ "$ruby_files" -eq 0 ]] && [[ "$php_files" -eq 0 ]]; then
+        echo "No supported code files found"
+        echo "Supported: .ts/.tsx/.js/.jsx (TS/JS), .py (Python), .go (Go), .rs (Rust), .java (Java), .cs (C#), .rb (Ruby), .php (PHP)"
+        return 1
     fi
+
+    echo "Found: $ts_files TS/JS, $py_files Python, $go_files Go, $rust_files Rust, $java_files Java, $csharp_files C#, $ruby_files Ruby, $php_files PHP"
+    echo "Indexing..."
+
+    # Index TypeScript/JavaScript
+    if [[ "$ts_files" -gt 0 ]]; then
+        echo "  Indexing TypeScript/JavaScript files..."
+        find "$project_dir" -type f \( -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.jsx" \) \
+            -not -path "*/node_modules/*" -not -path "*/dist/*" -not -path "*/build/*" \
+            -not -path "*/.next/*" -not -path "*/coverage/*" 2>/dev/null | \
+        while IFS= read -r file; do
+            update_ts_file_node "$file" "$project_dir" 2>/dev/null || true
+        done
+        echo "  ✓ Indexed $ts_files TypeScript/JavaScript files"
+    fi
+
+    # Index Python
+    if [[ "$py_files" -gt 0 ]]; then
+        echo "  Indexing Python files..."
+        find "$project_dir" -type f -name "*.py" \
+            -not -path "*/venv/*" -not -path "*/.venv/*" -not -path "*/__pycache__/*" \
+            -not -path "*/site-packages/*" 2>/dev/null | \
+        while IFS= read -r file; do
+            update_py_file_node "$file" "$project_dir" 2>/dev/null || true
+        done
+        echo "  ✓ Indexed $py_files Python files"
+    fi
+
+    # Index Go
+    if [[ "$go_files" -gt 0 ]]; then
+        echo "  Indexing Go files..."
+        find "$project_dir" -type f -name "*.go" \
+            -not -path "*/vendor/*" 2>/dev/null | \
+        while IFS= read -r file; do
+            update_go_file_node "$file" "$project_dir" 2>/dev/null || true
+        done
+        echo "  ✓ Indexed $go_files Go files"
+    fi
+
+    # Index Rust
+    if [[ "$rust_files" -gt 0 ]]; then
+        echo "  Indexing Rust files..."
+        find "$project_dir" -type f -name "*.rs" \
+            -not -path "*/target/*" 2>/dev/null | \
+        while IFS= read -r file; do
+            update_rust_file_node "$file" "$project_dir" 2>/dev/null || true
+        done
+        echo "  ✓ Indexed $rust_files Rust files"
+    fi
+
+    # Index Java
+    if [[ "$java_files" -gt 0 ]]; then
+        echo "  Indexing Java files..."
+        find "$project_dir" -type f -name "*.java" \
+            -not -path "*/build/*" -not -path "*/target/*" 2>/dev/null | \
+        while IFS= read -r file; do
+            update_java_file_node "$file" "$project_dir" 2>/dev/null || true
+        done
+        echo "  ✓ Indexed $java_files Java files"
+    fi
+
+    # Index C#
+    if [[ "$csharp_files" -gt 0 ]]; then
+        echo "  Indexing C# files..."
+        find "$project_dir" -type f -name "*.cs" \
+            -not -path "*/bin/*" -not -path "*/obj/*" 2>/dev/null | \
+        while IFS= read -r file; do
+            update_csharp_file_node "$file" "$project_dir" 2>/dev/null || true
+        done
+        echo "  ✓ Indexed $csharp_files C# files"
+    fi
+
+    # Index Ruby
+    if [[ "$ruby_files" -gt 0 ]]; then
+        echo "  Indexing Ruby files..."
+        find "$project_dir" -type f -name "*.rb" \
+            -not -path "*/vendor/*" 2>/dev/null | \
+        while IFS= read -r file; do
+            update_ruby_file_node "$file" "$project_dir" 2>/dev/null || true
+        done
+        echo "  ✓ Indexed $ruby_files Ruby files"
+    fi
+
+    # Index PHP
+    if [[ "$php_files" -gt 0 ]]; then
+        echo "  Indexing PHP files..."
+        find "$project_dir" -type f -name "*.php" \
+            -not -path "*/vendor/*" 2>/dev/null | \
+        while IFS= read -r file; do
+            update_php_file_node "$file" "$project_dir" 2>/dev/null || true
+        done
+        echo "  ✓ Indexed $php_files PHP files"
+    fi
+
+    echo "Code indexing complete!"
 }
 
 # Post-edit hook - incremental graph update for doc and code changes
@@ -160,6 +391,36 @@ post_edit() {
     # Handle Python files (not in venv/, .venv/, __pycache__/)
     if [[ "$file_path" == *.py ]] && [[ "$file_path" != */venv/* ]] && [[ "$file_path" != */.venv/* ]] && [[ "$file_path" != */__pycache__/* ]]; then
         update_py_file_node "$file_path" "$project_dir" &
+        return 0
+    fi
+
+    # Handle Rust files (not in target/)
+    if [[ "$file_path" == *.rs ]] && [[ "$file_path" != */target/* ]]; then
+        update_rust_file_node "$file_path" "$project_dir" &
+        return 0
+    fi
+
+    # Handle Java files (not in build/, target/)
+    if [[ "$file_path" == *.java ]] && [[ "$file_path" != */build/* ]] && [[ "$file_path" != */target/* ]]; then
+        update_java_file_node "$file_path" "$project_dir" &
+        return 0
+    fi
+
+    # Handle C# files (not in bin/, obj/)
+    if [[ "$file_path" == *.cs ]] && [[ "$file_path" != */bin/* ]] && [[ "$file_path" != */obj/* ]]; then
+        update_csharp_file_node "$file_path" "$project_dir" &
+        return 0
+    fi
+
+    # Handle Ruby files (not in vendor/)
+    if [[ "$file_path" == *.rb ]] && [[ "$file_path" != */vendor/* ]]; then
+        update_ruby_file_node "$file_path" "$project_dir" &
+        return 0
+    fi
+
+    # Handle PHP files (not in vendor/)
+    if [[ "$file_path" == *.php ]] && [[ "$file_path" != */vendor/* ]]; then
+        update_php_file_node "$file_path" "$project_dir" &
         return 0
     fi
 
@@ -479,6 +740,432 @@ finally:
 PYTHON_EOF
 }
 
+# Update a single Rust file's nodes
+update_rust_file_node() {
+    local file_path="$1"
+    local project_dir="$2"
+    local rel_path="${file_path#$project_dir/}"
+
+    python3 - "$PROJECT" "$file_path" "$rel_path" << 'PYTHON_EOF'
+import sys
+import re
+from pathlib import Path
+from neo4j import GraphDatabase
+
+project = sys.argv[1]
+file_path = Path(sys.argv[2])
+rel_path = sys.argv[3]
+
+driver = GraphDatabase.driver('bolt://localhost:7687')
+try:
+    with driver.session() as session:
+        if not file_path.exists():
+            session.run(f'''
+                MATCH (f:{project}:File {{path: $path}})
+                OPTIONAL MATCH (f)-[:CONTAINS]->(child)
+                DETACH DELETE f, child
+            ''', path=rel_path)
+            sys.exit(0)
+
+        content = file_path.read_text(encoding='utf-8')
+
+        # Extract function names: fn function_name(...
+        functions = re.findall(r'\bfn\s+(\w+)\s*[<(]', content)
+        # Extract struct names: struct StructName
+        structs = re.findall(r'\bstruct\s+(\w+)', content)
+        # Extract trait names: trait TraitName
+        traits = re.findall(r'\btrait\s+(\w+)', content)
+        # Extract impl blocks for tracking: impl StructName or impl Trait for Struct
+        impls = re.findall(r'\bimpl\s+(?:\w+\s+for\s+)?(\w+)', content)
+
+        # Delete old and recreate
+        session.run(f'''
+            MATCH (f:{project}:File {{path: $path}})
+            OPTIONAL MATCH (f)-[:CONTAINS]->(child)
+            DETACH DELETE f, child
+        ''', path=rel_path)
+
+    with driver.session() as session:
+        session.run(f'''
+            CREATE (f:{project}:File {{
+                path: $path,
+                language: 'rust',
+                updated_at: datetime()
+            }})
+        ''', path=rel_path)
+
+    for func in functions:
+        with driver.session() as session:
+            session.run(f'''
+                MATCH (f:{project}:File {{path: $path}})
+                CREATE (fn:{project}:Function {{name: $name, file: $path}})
+                CREATE (f)-[:CONTAINS]->(fn)
+            ''', path=rel_path, name=func)
+
+    for struct in structs:
+        with driver.session() as session:
+            session.run(f'''
+                MATCH (f:{project}:File {{path: $path}})
+                CREATE (s:{project}:Struct {{name: $name, file: $path}})
+                CREATE (f)-[:CONTAINS]->(s)
+            ''', path=rel_path, name=struct)
+
+    for trait in traits:
+        with driver.session() as session:
+            session.run(f'''
+                MATCH (f:{project}:File {{path: $path}})
+                CREATE (t:{project}:Interface {{name: $name, file: $path}})
+                CREATE (f)-[:CONTAINS]->(t)
+            ''', path=rel_path, name=trait)
+
+finally:
+    driver.close()
+PYTHON_EOF
+}
+
+# Update a single Java file's nodes
+update_java_file_node() {
+    local file_path="$1"
+    local project_dir="$2"
+    local rel_path="${file_path#$project_dir/}"
+
+    python3 - "$PROJECT" "$file_path" "$rel_path" << 'PYTHON_EOF'
+import sys
+import re
+from pathlib import Path
+from neo4j import GraphDatabase
+
+project = sys.argv[1]
+file_path = Path(sys.argv[2])
+rel_path = sys.argv[3]
+
+driver = GraphDatabase.driver('bolt://localhost:7687')
+try:
+    with driver.session() as session:
+        if not file_path.exists():
+            session.run(f'''
+                MATCH (f:{project}:File {{path: $path}})
+                OPTIONAL MATCH (f)-[:CONTAINS]->(child)
+                DETACH DELETE f, child
+            ''', path=rel_path)
+            sys.exit(0)
+
+        content = file_path.read_text(encoding='utf-8')
+
+        # Extract package
+        pkg_match = re.search(r'^\s*package\s+([\w.]+);', content, re.MULTILINE)
+        package = pkg_match.group(1) if pkg_match else 'unknown'
+
+        # Extract class names: public/private class ClassName
+        classes = re.findall(r'\b(?:public|private|protected)?\s*(?:static\s+)?class\s+(\w+)', content)
+        # Extract interface names
+        interfaces = re.findall(r'\b(?:public|private|protected)?\s*interface\s+(\w+)', content)
+        # Extract method names (simplified, doesn't handle all Java syntax)
+        methods = re.findall(r'\b(?:public|private|protected)\s+(?:static\s+)?(?:\w+<?\w*>?\s+)*(\w+)\s*\([^)]*\)\s*\{', content)
+
+        # Delete old and recreate
+        session.run(f'''
+            MATCH (f:{project}:File {{path: $path}})
+            OPTIONAL MATCH (f)-[:CONTAINS]->(child)
+            DETACH DELETE f, child
+        ''', path=rel_path)
+
+    with driver.session() as session:
+        session.run(f'''
+            CREATE (f:{project}:File {{
+                path: $path,
+                language: 'java',
+                package: $package,
+                updated_at: datetime()
+            }})
+        ''', path=rel_path, package=package)
+
+    for cls in classes:
+        with driver.session() as session:
+            session.run(f'''
+                MATCH (f:{project}:File {{path: $path}})
+                CREATE (c:{project}:Class {{name: $name, file: $path}})
+                CREATE (f)-[:CONTAINS]->(c)
+            ''', path=rel_path, name=cls)
+
+    for iface in interfaces:
+        with driver.session() as session:
+            session.run(f'''
+                MATCH (f:{project}:File {{path: $path}})
+                CREATE (i:{project}:Interface {{name: $name, file: $path}})
+                CREATE (f)-[:CONTAINS]->(i)
+            ''', path=rel_path, name=iface)
+
+    for method in methods:
+        with driver.session() as session:
+            session.run(f'''
+                MATCH (f:{project}:File {{path: $path}})
+                CREATE (m:{project}:Function {{name: $name, file: $path}})
+                CREATE (f)-[:CONTAINS]->(m)
+            ''', path=rel_path, name=method)
+
+finally:
+    driver.close()
+PYTHON_EOF
+}
+
+# Update a single C# file's nodes
+update_csharp_file_node() {
+    local file_path="$1"
+    local project_dir="$2"
+    local rel_path="${file_path#$project_dir/}"
+
+    python3 - "$PROJECT" "$file_path" "$rel_path" << 'PYTHON_EOF'
+import sys
+import re
+from pathlib import Path
+from neo4j import GraphDatabase
+
+project = sys.argv[1]
+file_path = Path(sys.argv[2])
+rel_path = sys.argv[3]
+
+driver = GraphDatabase.driver('bolt://localhost:7687')
+try:
+    with driver.session() as session:
+        if not file_path.exists():
+            session.run(f'''
+                MATCH (f:{project}:File {{path: $path}})
+                OPTIONAL MATCH (f)-[:CONTAINS]->(child)
+                DETACH DELETE f, child
+            ''', path=rel_path)
+            sys.exit(0)
+
+        content = file_path.read_text(encoding='utf-8')
+
+        # Extract namespace
+        ns_match = re.search(r'^\s*namespace\s+([\w.]+)', content, re.MULTILINE)
+        namespace = ns_match.group(1) if ns_match else 'unknown'
+
+        # Extract class names
+        classes = re.findall(r'\b(?:public|private|internal|protected)?\s*(?:static\s+)?(?:partial\s+)?class\s+(\w+)', content)
+        # Extract interface names
+        interfaces = re.findall(r'\b(?:public|private|internal|protected)?\s*interface\s+(\w+)', content)
+        # Extract struct names
+        structs = re.findall(r'\b(?:public|private|internal|protected)?\s*struct\s+(\w+)', content)
+        # Extract method names (simplified)
+        methods = re.findall(r'\b(?:public|private|protected|internal)\s+(?:static\s+)?(?:async\s+)?(?:\w+<?\w*>?\s+)*(\w+)\s*\([^)]*\)\s*\{', content)
+
+        # Delete old and recreate
+        session.run(f'''
+            MATCH (f:{project}:File {{path: $path}})
+            OPTIONAL MATCH (f)-[:CONTAINS]->(child)
+            DETACH DELETE f, child
+        ''', path=rel_path)
+
+    with driver.session() as session:
+        session.run(f'''
+            CREATE (f:{project}:File {{
+                path: $path,
+                language: 'csharp',
+                namespace: $namespace,
+                updated_at: datetime()
+            }})
+        ''', path=rel_path, namespace=namespace)
+
+    for cls in classes:
+        with driver.session() as session:
+            session.run(f'''
+                MATCH (f:{project}:File {{path: $path}})
+                CREATE (c:{project}:Class {{name: $name, file: $path}})
+                CREATE (f)-[:CONTAINS]->(c)
+            ''', path=rel_path, name=cls)
+
+    for iface in interfaces:
+        with driver.session() as session:
+            session.run(f'''
+                MATCH (f:{project}:File {{path: $path}})
+                CREATE (i:{project}:Interface {{name: $name, file: $path}})
+                CREATE (f)-[:CONTAINS]->(i)
+            ''', path=rel_path, name=iface)
+
+    for struct in structs:
+        with driver.session() as session:
+            session.run(f'''
+                MATCH (f:{project}:File {{path: $path}})
+                CREATE (s:{project}:Struct {{name: $name, file: $path}})
+                CREATE (f)-[:CONTAINS]->(s)
+            ''', path=rel_path, name=struct)
+
+    for method in methods:
+        with driver.session() as session:
+            session.run(f'''
+                MATCH (f:{project}:File {{path: $path}})
+                CREATE (m:{project}:Function {{name: $name, file: $path}})
+                CREATE (f)-[:CONTAINS]->(m)
+            ''', path=rel_path, name=method)
+
+finally:
+    driver.close()
+PYTHON_EOF
+}
+
+# Update a single Ruby file's nodes
+update_ruby_file_node() {
+    local file_path="$1"
+    local project_dir="$2"
+    local rel_path="${file_path#$project_dir/}"
+
+    python3 - "$PROJECT" "$file_path" "$rel_path" << 'PYTHON_EOF'
+import sys
+import re
+from pathlib import Path
+from neo4j import GraphDatabase
+
+project = sys.argv[1]
+file_path = Path(sys.argv[2])
+rel_path = sys.argv[3]
+
+driver = GraphDatabase.driver('bolt://localhost:7687')
+try:
+    with driver.session() as session:
+        if not file_path.exists():
+            session.run(f'''
+                MATCH (f:{project}:File {{path: $path}})
+                OPTIONAL MATCH (f)-[:CONTAINS]->(child)
+                DETACH DELETE f, child
+            ''', path=rel_path)
+            sys.exit(0)
+
+        content = file_path.read_text(encoding='utf-8')
+
+        # Extract module names
+        modules = re.findall(r'^\s*module\s+(\w+)', content, re.MULTILINE)
+        # Extract class names
+        classes = re.findall(r'^\s*class\s+(\w+)', content, re.MULTILINE)
+        # Extract method/function names: def method_name
+        methods = re.findall(r'^\s*def\s+(\w+)', content, re.MULTILINE)
+
+        # Delete old and recreate
+        session.run(f'''
+            MATCH (f:{project}:File {{path: $path}})
+            OPTIONAL MATCH (f)-[:CONTAINS]->(child)
+            DETACH DELETE f, child
+        ''', path=rel_path)
+
+    with driver.session() as session:
+        session.run(f'''
+            CREATE (f:{project}:File {{
+                path: $path,
+                language: 'ruby',
+                updated_at: datetime()
+            }})
+        ''', path=rel_path)
+
+    for cls in classes:
+        with driver.session() as session:
+            session.run(f'''
+                MATCH (f:{project}:File {{path: $path}})
+                CREATE (c:{project}:Class {{name: $name, file: $path}})
+                CREATE (f)-[:CONTAINS]->(c)
+            ''', path=rel_path, name=cls)
+
+    for method in methods:
+        with driver.session() as session:
+            session.run(f'''
+                MATCH (f:{project}:File {{path: $path}})
+                CREATE (m:{project}:Function {{name: $name, file: $path}})
+                CREATE (f)-[:CONTAINS]->(m)
+            ''', path=rel_path, name=method)
+
+finally:
+    driver.close()
+PYTHON_EOF
+}
+
+# Update a single PHP file's nodes
+update_php_file_node() {
+    local file_path="$1"
+    local project_dir="$2"
+    local rel_path="${file_path#$project_dir/}"
+
+    python3 - "$PROJECT" "$file_path" "$rel_path" << 'PYTHON_EOF'
+import sys
+import re
+from pathlib import Path
+from neo4j import GraphDatabase
+
+project = sys.argv[1]
+file_path = Path(sys.argv[2])
+rel_path = sys.argv[3]
+
+driver = GraphDatabase.driver('bolt://localhost:7687')
+try:
+    with driver.session() as session:
+        if not file_path.exists():
+            session.run(f'''
+                MATCH (f:{project}:File {{path: $path}})
+                OPTIONAL MATCH (f)-[:CONTAINS]->(child)
+                DETACH DELETE f, child
+            ''', path=rel_path)
+            sys.exit(0)
+
+        content = file_path.read_text(encoding='utf-8')
+
+        # Extract namespace
+        ns_match = re.search(r'^\s*namespace\s+([\w\\\\]+);', content, re.MULTILINE)
+        namespace = ns_match.group(1) if ns_match else 'unknown'
+
+        # Extract class names
+        classes = re.findall(r'\b(?:abstract\s+)?class\s+(\w+)', content)
+        # Extract interface names
+        interfaces = re.findall(r'\binterface\s+(\w+)', content)
+        # Extract trait names (PHP specific)
+        traits = re.findall(r'\btrait\s+(\w+)', content)
+        # Extract function names: function functionName
+        functions = re.findall(r'\bfunction\s+(\w+)\s*\(', content)
+
+        # Delete old and recreate
+        session.run(f'''
+            MATCH (f:{project}:File {{path: $path}})
+            OPTIONAL MATCH (f)-[:CONTAINS]->(child)
+            DETACH DELETE f, child
+        ''', path=rel_path)
+
+    with driver.session() as session:
+        session.run(f'''
+            CREATE (f:{project}:File {{
+                path: $path,
+                language: 'php',
+                namespace: $namespace,
+                updated_at: datetime()
+            }})
+        ''', path=rel_path, namespace=namespace)
+
+    for cls in classes:
+        with driver.session() as session:
+            session.run(f'''
+                MATCH (f:{project}:File {{path: $path}})
+                CREATE (c:{project}:Class {{name: $name, file: $path}})
+                CREATE (f)-[:CONTAINS]->(c)
+            ''', path=rel_path, name=cls)
+
+    for iface in interfaces:
+        with driver.session() as session:
+            session.run(f'''
+                MATCH (f:{project}:File {{path: $path}})
+                CREATE (i:{project}:Interface {{name: $name, file: $path}})
+                CREATE (f)-[:CONTAINS]->(i)
+            ''', path=rel_path, name=iface)
+
+    for func in functions:
+        with driver.session() as session:
+            session.run(f'''
+                MATCH (f:{project}:File {{path: $path}})
+                CREATE (fn:{project}:Function {{name: $name, file: $path}})
+                CREATE (f)-[:CONTAINS]->(fn)
+            ''', path=rel_path, name=func)
+
+finally:
+    driver.close()
+PYTHON_EOF
+}
+
 # Show current graph statistics
 status() {
     if ! check_connection; then
@@ -726,9 +1413,10 @@ case "${1:-help}" in
         echo "Current project: $PROJECT"
         echo ""
         echo "Automatic Updates:"
-        echo "  • Session start: Auto-populates if docs/ exists but graph is empty"
-        echo "  • Post-edit: Incrementally updates .md, .go, .ts, .tsx, .js, .jsx, .py files"
+        echo "  • Session start: Auto-populates docs if docs/ exists and graph is empty"
+        echo "  • Session start: Auto-populates code if code files exist and graph has no code"
+        echo "  • Post-edit: Incrementally updates .md, .ts/.tsx/.js/.jsx, .py, .go, .rs, .java, .cs, .rb, .php files"
         echo ""
-        echo "Supported Languages: Go, TypeScript, JavaScript, Python, Markdown"
+        echo "Supported Languages: TypeScript, JavaScript, Python, Go, Rust, Java, C#, Ruby, PHP, Markdown"
         ;;
 esac

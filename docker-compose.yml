@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   nornicdb:
-    image: nornicdb/nornicdb:latest
+    image: timothyswt/nornicdb-arm64-metal-bge:latest
     container_name: nornicdb
     restart: unless-stopped
     ports:
